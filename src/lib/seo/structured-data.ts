@@ -242,6 +242,10 @@ export function generateWebPageSchema(
     pt: 'pt-BR',
     ar: 'ar-AR',
     it: 'it-IT',
+    id: 'id-ID',
+    vi: 'vi-VN',
+    ro: 'ro-RO',
+    pl: 'pl-PL',
   };
 
   return {

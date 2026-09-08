@@ -24,8 +24,11 @@ import 'reactflow/dist/style.css';
 import { useTranslations } from 'next-intl';
 import { logger } from '@/lib/utils/logger';
 import { WorkflowNode, WorkflowEdge, ToolNodeData, WorkflowExecutionState, SavedWorkflow, WorkflowTemplate, WorkflowOutputFile } from '@/types/workflow';
-import { validateWorkflow, validateConnection, topologicalSort, findInputNodes } from '@/lib/workflow/engine';
+import { validateWorkflow, validateConnection, topologicalSort, findInputNodes, distributeFilesToInputNodes } from '@/lib/workflow/engine';
 import { executeNode, collectInputFiles } from '@/lib/workflow/executor';
+import { LIBREOFFICE_TOOL_IDS, preloadLibreOfficeConverter } from '@/lib/libreoffice/shared-converter';
+import { isCrossOriginIsolated } from '@/lib/utils/cross-origin-isolated';
+import { buildNodeOutputsFromResult, deriveWorkflowFailureContext } from '@/lib/workflow/execution-utils';
 import { saveWorkflow, getSavedWorkflows, deleteWorkflow, duplicateWorkflow, exportWorkflow, importWorkflow } from '@/lib/workflow/storage';
 import { createExecutionRecord, addExecutionRecord, completeExecutionRecord } from '@/lib/workflow/history';
 import type { WorkflowExecutionRecord } from '@/types/workflow-history';
@@ -38,7 +41,11 @@ import { WorkflowLibrary } from './WorkflowLibrary';
 import { WorkflowControls } from './WorkflowControls';
 import { NodeSettingsPanel } from './NodeSettingsPanel';
 import { WorkflowPreview } from './WorkflowPreview';
+import { WORKFLOW_TOOL_DROP_EVENT, type WorkflowToolDropEventDetail } from './dragEvents';
 import { Undo2, Redo2, PanelLeftClose, PanelLeftOpen, PanelRightClose, PanelRightOpen } from 'lucide-react';
+
+// Global drag data cache for WebView2/Tauri compatibility
+let globalDragData: ToolNodeData | null = null;
 
 // Node types for ReactFlow
 const nodeTypes = {
@@ -103,6 +110,7 @@ function WorkflowEditorContent() {
 
     // AbortController for cancelling workflow execution
     const executionAbortController = useRef<AbortController | null>(null);
+    const lastToolDropRef = useRef<{ toolId: string; clientX: number; clientY: number; time: number } | null>(null);
 
     /**
      * Register a Blob URL for cleanup
@@ -269,49 +277,106 @@ function WorkflowEditorContent() {
      * Handle drag over for dropping new nodes
      */
     const onDragOver = useCallback((event: React.DragEvent) => {
+        // Always allow drop in Tauri/WebView2 environment where dataTransfer may be restricted
         event.preventDefault();
-        event.dataTransfer.dropEffect = 'move';
+        if (event.dataTransfer) {
+            event.dataTransfer.dropEffect = 'move';
+        }
     }, []);
 
     /**
      * Handle dropping a tool node onto the canvas
      */
+    const addToolNodeAtClientPosition = useCallback((nodeData: ToolNodeData, clientX: number, clientY: number) => {
+        if (!reactFlowWrapper.current || !reactFlowInstance) return;
+
+        const position = reactFlowInstance.screenToFlowPosition({
+            x: clientX,
+            y: clientY,
+        });
+
+        const newNode: Node<ToolNodeData> = {
+            id: getNodeId(),
+            type: 'toolNode',
+            position,
+            data: { ...nodeData, settings: {} },
+        };
+
+        setNodes((nds) => nds.concat(newNode));
+        lastToolDropRef.current = {
+            toolId: nodeData.toolId,
+            clientX,
+            clientY,
+            time: Date.now(),
+        };
+    }, [reactFlowInstance, setNodes]);
+
     const onDrop = useCallback(
         (event: React.DragEvent) => {
             event.preventDefault();
 
             if (!reactFlowWrapper.current || !reactFlowInstance) return;
 
-            const reactFlowBounds = reactFlowWrapper.current.getBoundingClientRect();
-            const nodeDataStr = event.dataTransfer.getData('application/reactflow');
+            // Try to resolve nodeData from global variable first, fallback to dataTransfer for WebView2 compatibility
+            let nodeData: ToolNodeData | null = globalDragData;
+            if (!nodeData) {
+                const nodeDataStr = event.dataTransfer.getData('application/reactflow');
+                if (nodeDataStr) {
+                    try {
+                        nodeData = JSON.parse(nodeDataStr);
+                    } catch (e) {
+                        logger.error('Failed to parse reactflow drag data:', e);
+                    }
+                }
+            }
 
-            if (!nodeDataStr) return;
+            // Always reset the global drag data cache
+            globalDragData = null;
 
-            const nodeData: ToolNodeData = JSON.parse(nodeDataStr);
+            if (!nodeData) return;
 
-            const position = reactFlowInstance.screenToFlowPosition({
-                x: event.clientX,
-                y: event.clientY,
-            });
-
-            const newNode: Node<ToolNodeData> = {
-                id: getNodeId(),
-                type: 'toolNode',
-                position,
-                data: { ...nodeData, settings: {} },
-            };
-
-            setNodes((nds) => nds.concat(newNode));
+            addToolNodeAtClientPosition(nodeData, event.clientX, event.clientY);
         },
-        [reactFlowInstance, setNodes]
+        [reactFlowInstance, addToolNodeAtClientPosition]
     );
+
+    useEffect(() => {
+        const handleFallbackToolDrop = (event: Event) => {
+            const { nodeData, clientX, clientY } = (event as CustomEvent<WorkflowToolDropEventDetail>).detail;
+            if (!nodeData) return;
+
+            const lastDrop = lastToolDropRef.current;
+            const isDuplicateNativeDrop = lastDrop &&
+                lastDrop.toolId === nodeData.toolId &&
+                Math.abs(lastDrop.clientX - clientX) < 8 &&
+                Math.abs(lastDrop.clientY - clientY) < 8 &&
+                Date.now() - lastDrop.time < 500;
+
+            if (isDuplicateNativeDrop) return;
+
+            addToolNodeAtClientPosition(nodeData, clientX, clientY);
+        };
+
+        window.addEventListener(WORKFLOW_TOOL_DROP_EVENT, handleFallbackToolDrop);
+        return () => window.removeEventListener(WORKFLOW_TOOL_DROP_EVENT, handleFallbackToolDrop);
+    }, [addToolNodeAtClientPosition]);
 
     /**
      * Handle drag start from sidebar
      */
     const onDragStart = useCallback((event: React.DragEvent, nodeData: ToolNodeData) => {
+        globalDragData = nodeData;
         event.dataTransfer.setData('application/reactflow', JSON.stringify(nodeData));
+        // Add standard plain text format fallback to ensure drop action gets activated under WebView2/Tauri
+        event.dataTransfer.setData('text/plain', nodeData.toolId);
         event.dataTransfer.effectAllowed = 'move';
+    }, []);
+
+    /**
+     * Handle drag end to clean up global drag data
+     */
+    const onDragEnd = useCallback(() => {
+        globalDragData = null;
     }, []);
 
     /**
@@ -370,6 +435,9 @@ function WorkflowEditorContent() {
             })));
         });
 
+        const localExecutedNodes: string[] = [];
+        let currentExecutingNodeId: string | null = null;
+
         try {
             // Find input nodes and assign files to them
             const inputNodes = findInputNodes(nodes as WorkflowNode[], edges as WorkflowEdge[]);
@@ -383,13 +451,14 @@ function WorkflowEditorContent() {
                 `for ${inputNodes.length} input node(s): ${inputNodes.map(n => n.data.label).join(', ')}`
             );
 
-            // Assign input files to all input nodes
-            // Note: All input nodes receive ALL files
+            const inputFileAssignments = distributeFilesToInputNodes(inputFiles, inputNodes);
+
             setNodes((nds) => nds.map(node => {
-                if (inputNodes.some(n => n.id === node.id)) {
+                const assigned = inputFileAssignments.get(node.id);
+                if (assigned !== undefined) {
                     return {
                         ...node,
-                        data: { ...node.data, inputFiles },
+                        data: { ...node.data, inputFiles: assigned },
                     };
                 }
                 return node;
@@ -398,8 +467,19 @@ function WorkflowEditorContent() {
             // Store outputs for each node
             const nodeOutputs = new Map<string, (Blob | WorkflowOutputFile)[]>();
 
-            // Track executed nodes locally to avoid stale closure issues
-            const localExecutedNodes: string[] = [];
+            const needsLibreOffice = executionOrder.some((nodeId) => {
+                const node = (nodes as WorkflowNode[]).find((n) => n.id === nodeId);
+                return node ? LIBREOFFICE_TOOL_IDS.has(node.data.toolId) : false;
+            });
+
+            if (needsLibreOffice && isCrossOriginIsolated()) {
+                logger.log('[Workflow] Preloading LibreOffice conversion engine...');
+                await preloadLibreOfficeConverter();
+            } else if (needsLibreOffice) {
+                logger.log(
+                    '[Workflow] Cross-Origin Isolation unavailable; Word .docx will use compatibility converter.'
+                );
+            }
 
             // Execute each node in order
             for (let i = 0; i < executionOrder.length; i++) {
@@ -410,6 +490,7 @@ function WorkflowEditorContent() {
                 }
 
                 const nodeId = executionOrder[i];
+                currentExecutingNodeId = nodeId;
                 // Get fresh node state by reading from the latest nodes
                 // Use a Promise to ensure the state updater runs before we continue
                 const currentNode = await new Promise<WorkflowNode | undefined>((resolve) => {
@@ -447,11 +528,19 @@ function WorkflowEditorContent() {
                     nodeId,
                     nodes as WorkflowNode[],
                     edges as WorkflowEdge[],
-                    nodeOutputs
+                    nodeOutputs,
+                    inputFileAssignments
                 );
 
-                // If this is an input node without parent outputs, use the selected files
-                const filesToProcess = nodeInputFiles.length > 0 ? nodeInputFiles : inputFiles;
+                const isInputNode = inputNodes.some((n) => n.id === nodeId);
+                const filesToProcess =
+                    nodeInputFiles.length > 0
+                        ? nodeInputFiles
+                        : isInputNode
+                          ? []
+                          : inputNodes.length === 1
+                            ? inputFiles
+                            : [];
 
                 // Log input sizes for debugging data flow
                 const inputSizes = filesToProcess.map((f, idx) => {
@@ -545,58 +634,13 @@ function WorkflowEditorContent() {
                     throw error;
                 }
 
-                // Store output for downstream nodes with proper filename metadata
-                let outputs: (Blob | WorkflowOutputFile)[] = [];
-
-                if (result.result) {
-                    if (Array.isArray(result.result)) {
-                        // Handle array results - ensure each has proper metadata
-                        const resultArray = result.result;
-                        outputs = resultArray.map((item, index) => {
-                            if (item instanceof Blob) {
-                                // Plain Blob - wrap with metadata
-                                const baseFilename = result.filename || `${currentNode!.data.label}_output`;
-                                const filename = resultArray.length > 1 
-                                    ? `${baseFilename}_${index + 1}.pdf`
-                                    : `${baseFilename}.pdf`;
-                                return {
-                                    blob: item,
-                                    filename: filename
-                                };
-                            }
-                            // Already a WorkflowOutputFile
-                            return item as WorkflowOutputFile;
-                        });
-                    } else {
-                        // Single result
-                        if (result.filename) {
-                            outputs = [{
-                                blob: result.result,
-                                filename: result.filename
-                            }];
-                        } else {
-                            // Generate default filename from node label
-                            const filename = `${currentNode.data.label.replace(/\s+/g, '_')}_output.pdf`;
-                            outputs = [{
-                                blob: result.result,
-                                filename: filename
-                            }];
-                        }
-                    }
-                } else {
+                if (!result.result) {
                     // Processor returned success but no result blob (e.g. extract-images, extract-attachments)
                     // Pass through input files so downstream nodes can still process
                     logger.warn(`[Workflow] Node "${currentNode.data.label}" produced no output blob, passing through input files`);
-                    outputs = filesToProcess.map((f, idx) => {
-                        if (f instanceof File) {
-                            return { blob: f, filename: f.name };
-                        }
-                        if ('blob' in f && (f as WorkflowOutputFile).blob) {
-                            return f as WorkflowOutputFile;
-                        }
-                        return { blob: f as Blob, filename: `passthrough_${idx + 1}.pdf` };
-                    });
                 }
+
+                const outputs = buildNodeOutputsFromResult(result, currentNode.data.label, filesToProcess);
 
                 nodeOutputs.set(nodeId, outputs);
                 localExecutedNodes.push(nodeId);
@@ -674,21 +718,13 @@ function WorkflowEditorContent() {
 
         } catch (error) {
             logger.error('[Workflow Execution] Workflow execution failed:', error);
-            
-            // Extract detailed error information
-            const errorMessage = error instanceof Error ? error.message : 'Unknown error occurred';
-            const isCancelled = errorMessage.includes('cancelled by user');
-            
-            // Get current execution state for failed node info
-            let failedNodeId = '';
-            let successfulCount = 0;
-            setExecutionState(prev => {
-                failedNodeId = (error as Error & { nodeId?: string })?.nodeId || prev.currentNodeId || '';
-                successfulCount = prev.executedNodes.length;
-                return prev;
-            });
-            
-            const errorCode = (error as Error & { code?: string })?.code;
+
+            const {
+                failedNodeId,
+                successfulCount,
+                errorMessage,
+                isCancelled,
+            } = deriveWorkflowFailureContext(error, currentExecutingNodeId, localExecutedNodes);
             
             // Find the failed node name for better error reporting
             const failedNode = nodes.find(n => n.id === failedNodeId);
@@ -968,6 +1004,7 @@ function WorkflowEditorContent() {
             {/* Left Sidebar - Tool Library */}
             <ToolSidebar
                 onDragStart={onDragStart}
+                onDragEnd={onDragEnd}
                 isCollapsed={isLeftSidebarCollapsed}
                 onToggleCollapse={() => setIsLeftSidebarCollapsed(!isLeftSidebarCollapsed)}
             />
@@ -995,7 +1032,12 @@ function WorkflowEditorContent() {
                 </div>
 
                 {/* Canvas */}
-                <div className="flex-1 relative" ref={reactFlowWrapper}>
+                <div 
+                    className="flex-1 relative" 
+                    ref={reactFlowWrapper}
+                    onDragOver={onDragOver}
+                    onDrop={onDrop}
+                >
                     {/* Undo/Redo buttons */}
                     <div className="absolute top-2 left-2 z-10 flex gap-1">
                         <button

@@ -1,3 +1,5 @@
+import { locales as canonicalLocales } from './config';
+
 /**
  * Internationalization utilities
  * Re-exports all i18n configuration and utilities
@@ -36,7 +38,7 @@ export {
 } from './fallback';
 
 // Legacy exports for backward compatibility
-export const SUPPORTED_LOCALES = ['en', 'ja', 'ko', 'es', 'fr', 'de', 'zh', 'zh-TW', 'pt', 'ar', 'it'] as const;
+export const SUPPORTED_LOCALES = canonicalLocales;
 export const DEFAULT_LOCALE = 'en';
 export const LOCALE_CONFIG = {
   en: { name: 'English', nativeName: 'English', direction: 'ltr' as const },
@@ -50,4 +52,8 @@ export const LOCALE_CONFIG = {
   pt: { name: 'Portuguese', nativeName: 'Português', direction: 'ltr' as const },
   ar: { name: 'Arabic', nativeName: 'العربية', direction: 'rtl' as const },
   it: { name: 'Italian', nativeName: 'Italiano', direction: 'ltr' as const },
+  id: { name: 'Indonesian', nativeName: 'Bahasa Indonesia', direction: 'ltr' as const },
+  vi: { name: 'Vietnamese', nativeName: 'Tiếng Việt', direction: 'ltr' as const },
+  ro: { name: 'Romanian', nativeName: 'Română', direction: 'ltr' as const },
+  pl: { name: 'Polish', nativeName: 'Polski', direction: 'ltr' as const },
 };
